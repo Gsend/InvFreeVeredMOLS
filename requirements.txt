@@ -1,0 +1,20 @@
+# InvFreeVeredMOLS — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# These are the runtime + test deps for the Python side of the project.
+# The Rust crate has its own deps managed by Cargo (see rust/Cargo.toml).
+
+# Runtime
+numpy>=1.23
+torch>=2.0
+
+# Build the Python ↔ Rust binding (optional but recommended)
+maturin>=1.5
+
+# Tests
+pytest>=7.0
+
+# Optional — only needed if you want the SciPy LU fallback in the NumPy
+# reference implementation inside examples/demo_ols_python.py
+scipy>=1.11
