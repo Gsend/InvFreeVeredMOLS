@@ -1,31 +1,62 @@
 [package]
-name = "olssm"
-version = "0.1.0"
-edition = "2021"
-description = "SM K-FAC optimizer with fast Rust backend"
-license = "MIT"
+name        = "olssm"
+version     = "0.1.0"
+edition     = "2021"
+description = "Closed-form OLS algorithms (Senderovich-Sandra): Modified Cholesky, SGSO, Weighted Generalised Inverse — without matrix inversion."
+license     = "MIT"
+keywords    = ["ols", "least-squares", "linear-algebra", "regression"]
+categories  = ["mathematics", "science"]
+authors     = ["Gilad Senderovich <giladsnd@gmail.com>"]
 
 [lib]
-name = "olssm"
-crate-type = ["cdylib", "rlib"]
+name        = "olssm"
+crate-type  = ["cdylib", "rlib"]
 
 [dependencies]
-nalgebra = { version = "0.33", features = ["std"] }
-thiserror = "1.0"
-pyo3      = { version = "0.21", features = ["extension-module"], optional = true }
-numpy     = { version = "0.21", optional = true }
-faer      = { version = "0.19", features = ["std"] }
+# Core dense-linear-algebra library used for input/output and reference paths.
+nalgebra    = { version = "0.33", features = ["std"] }
+# Idiomatic error-handling derives.
+thiserror   = "1.0"
+# SIMD-accelerated LU solve / inverse for general Gram matrices.
+faer        = { version = "0.19", features = ["std"] }
+# BLAS-accelerated dot products (used by `simplified_gram_schmidt` when the
+# `blas` feature is enabled).  `openblas-src` provides the underlying BLAS
+# implementation linked via `cblas`'s safe Rust wrappers.
+cblas         = { version = "0.4",  optional = true }
+openblas-src  = { version = "0.10", optional = true, features = ["system"] }
+# Python bindings (optional — only built with --features python).
+pyo3        = { version = "0.21", features = ["extension-module"], optional = true }
+numpy       = { version = "0.21",                                  optional = true }
 
 [build-dependencies]
-cbindgen = "0.26"
+# Generates `include/olssm.h` for C/C++ consumers (see build.rs).
+cbindgen    = "0.26"
 
 [features]
-default = []
-python  = ["pyo3", "numpy"]
-extension-module = ["python"]
+# Default: BLAS-accelerated SGSO via cblas + openblas-src.
+# Build prerequisite: OpenBLAS must be installed on the system (link search
+# path must contain libopenblas).  See README §Installation for per-OS notes
+# (Windows: vcpkg install openblas;  Linux: apt install libopenblas-dev;
+#  macOS: brew install openblas).
+#
+# If OpenBLAS is unavailable on your machine, build with
+#     cargo build --release --no-default-features --features python
+# to fall back to a pure-nalgebra SGSO that does not require any system
+# linear-algebra library.
+default            = ["blas"]
+blas               = ["dep:cblas", "dep:openblas-src"]
+python             = ["pyo3", "numpy"]
+# Backwards-compat alias used by maturin during `maturin develop`.
+extension-module   = ["python"]
 
 [dev-dependencies]
-approx = "0.5"
+# Float comparisons in unit tests.
+approx      = "0.5"
+# Examples (`cargo run --example …`) use a seeded RNG for reproducible inputs.
+rand        = "0.8"
+rand_distr  = "0.4"
+rand_chacha = "0.3"
 
 [patch.crates-io]
+# Local patch for a faer transitive dependency.
 nano-gemm-c64 = { path = "patches/nano-gemm-c64" }

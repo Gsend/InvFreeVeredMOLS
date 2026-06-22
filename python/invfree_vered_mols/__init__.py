@@ -1,40 +1,67 @@
 """
-InvFreeVeredMOLS — Inversion-Free Vered Method for OLS-Stable K-FAC
+invfree_vered_mols — Inversion-Free OLS Solvers
 
-Public API
+Python re-export of the three Senderovich-Sandra algorithms implemented in
+the Rust `olssm` crate.
+
+Algorithms
 ----------
-- OlsSmKFAC                 : the SM K-FAC optimizer (PyTorch torch.optim.Optimizer)
-- GramMatrixEstimator       : utility for incremental Gram estimation under bf16
-- KFACHooks                 : forward/backward hook wrapper used by the optimizer
-- ConfigurationError        : raised on invalid optimizer config
-- backend module            : low-level eigh / apply primitives (auto-selects
-                              Rust olssm backend if compiled, else PyTorch fallback)
+- `modified_cholesky(X, y)`             → C matrix (augmented Gram + LU + row-normalise)
+- `back_substitute(C)`                  → β  (back-sub on C with β[p] = −1)
+- `solve_ols(X, y)`                     → β  (Modified Cholesky + back-substitute combined)
+- `simplified_gram_schmidt(X)`          → Q  (non-normalised orthogonal basis)
+- `weighted_generalized_inverse(X, W)`  → G  ((XᵀWX)⁻¹ XᵀW via LU solve)
+
+All arrays must be C-contiguous float64.
 
 Usage
 -----
-    from invfree_vered_mols import OlsSmKFAC
-    optimizer = OlsSmKFAC(model, lr=1e-3, damping=1e-2)
-    # standard PyTorch train loop:
-    loss.backward()
-    optimizer.step()
+    import numpy as np
+    from invfree_vered_mols import solve_ols
 
-For the Rust accelerated backend, see scripts/build_rust.ps1 (Windows) or
-scripts/build_rust.sh (Linux/macOS) to compile the `olssm` cdylib and place
-it on PYTHONPATH.
+    X = np.random.randn(300, 100)
+    y = np.random.randn(300)
+    beta = solve_ols(X, y)
 """
-from .olssm_kfac import OlsSmKFAC
-from .gram_estimator import GramMatrixEstimator
-from .kfac_hooks import KFACHooks
-from .errors import ConfigurationError
-from . import backend
-from . import bf16_linalg
+from __future__ import annotations
+
+try:
+    import olssm as _olssm
+    _HAVE_RUST = True
+except ImportError:
+    _HAVE_RUST = False
 
 __version__ = "0.1.0"
+
+
+def _missing_rust(*_a, **_kw):
+    raise ImportError(
+        "The Rust `olssm` extension is not installed.  Build it with:\n"
+        "    cd rust && maturin develop --features python --release\n"
+        "or run the convenience script:\n"
+        "    .\\scripts\\build_rust.ps1 -Release      (Windows)\n"
+        "    ./scripts/build_rust.sh --release        (Linux/macOS)\n"
+    )
+
+
+if _HAVE_RUST:
+    modified_cholesky          = _olssm.modified_cholesky
+    back_substitute            = _olssm.back_substitute
+    solve_ols                  = _olssm.solve_ols
+    simplified_gram_schmidt    = _olssm.simplified_gram_schmidt
+    weighted_generalized_inverse = _olssm.weighted_generalized_inverse
+else:
+    modified_cholesky            = _missing_rust
+    back_substitute              = _missing_rust
+    solve_ols                    = _missing_rust
+    simplified_gram_schmidt      = _missing_rust
+    weighted_generalized_inverse = _missing_rust
+
+
 __all__ = [
-    "OlsSmKFAC",
-    "GramMatrixEstimator",
-    "KFACHooks",
-    "ConfigurationError",
-    "backend",
-    "bf16_linalg",
+    "modified_cholesky",
+    "back_substitute",
+    "solve_ols",
+    "simplified_gram_schmidt",
+    "weighted_generalized_inverse",
 ]

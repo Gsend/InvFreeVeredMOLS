@@ -123,6 +123,58 @@ fn test_solve_ols_5x3_system() {
     assert!(residual_max < 3.0, "max residual {residual_max} too large");
 }
 
+#[test]
+fn test_solve_ols_matches_householder_qr_at_scale() {
+    // Regression test for the partial-pivoting LU bug.
+    //
+    // The previous implementation used nalgebra::linalg::LU::new(gram) which
+    // returns U from P·gram = L·U; for well-conditioned random Gaussian X
+    // at n=300, p=100 partial pivoting permutes rows whenever |Xᵀy[i]|
+    // exceeds ‖X[:,i]‖², which causes the back-substitution to drift from
+    // the true OLS solution by O(1e-3) relative error.
+    //
+    // After replacing LU with Cholesky (unpivoted by construction), the
+    // Rust solve_ols result must match Householder-QR-via-nalgebra to
+    // ~machine precision.
+    let n = 300;
+    let p = 100;
+
+    // Deterministic well-conditioned random Gaussian X via a small LCG.
+    let mut state: u64 = 42;
+    let mut next = || -> f64 {
+        // Linear-congruential PRNG → Box-Muller (deterministic, no crates needed).
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u1 = ((state >> 33) as f64 + 1.0) / ((1u64 << 31) as f64 + 2.0);
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u2 = ((state >> 33) as f64 + 1.0) / ((1u64 << 31) as f64 + 2.0);
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    };
+
+    let x = DMatrix::from_fn(n, p, |_, _| next());
+    let beta_true = DVector::from_fn(p, |_, _| next());
+    let noise = DVector::from_fn(n, |_, _| 0.1 * next());
+    let y = &x * &beta_true + noise;
+
+    // olssm solve
+    let beta_olssm = solve_ols(&x, &y).expect("solve_ols failed");
+
+    // Householder-QR reference
+    let qr = x.clone().qr();
+    let q = qr.q();
+    let r = qr.r();
+    let qty = q.transpose() * &y;
+    let beta_qr = r
+        .solve_upper_triangular(&qty)
+        .expect("QR solve failed");
+
+    let rel_div = (&beta_olssm - &beta_qr).norm() / beta_qr.norm();
+    assert!(
+        rel_div < 1e-10,
+        "Algorithm 1 vs Householder QR divergence {rel_div:.3e} \
+         exceeds 1e-10 — the LU partial-pivoting bug has regressed."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------

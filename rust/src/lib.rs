@@ -1,11 +1,18 @@
 //! `olssm` — Closed-form OLS without inversion or normalisation.
 //!
-//! Exposes three algorithms from:
-//! or Normalization" —  Senderovich  & Sandra .
+//! Exposes three algorithms from the paper
+//! "Closed-form OLS without inversion or normalisation" — Senderovich & Sandra:
+//!
+//!   1. Modified Cholesky          — augmented Gram + LU + row-normalise + back-substitute
+//!   2. Simplified Gram-Schmidt    — non-normalised orthogonalisation (SGSO)
+//!   3. Weighted generalised inverse — `(XᵀWX)⁻¹ Xᵀ W` via LU solve
+//!
+//! Plus general SIMD-accelerated LU solve / inverse utilities for Gram-style
+//! matrices (`lu_solve_gram`, `lu_solve_gram_vec`, `lu_inverse_gram`).
 //!
 //! # Usage
 //! - **Rust**: import `olssm::algorithms::*` directly.
-//! - **Python**: `import olssm` after `maturin develop` / `pip install`.
+//! - **Python**: `import olssm` after `maturin develop --features python`.
 //! - **C/C++**: link against `libolssm` and include `olssm.h`.
 
 pub mod algorithms;
@@ -18,7 +25,7 @@ pub mod ffi;
 #[cfg(feature = "python")]
 mod python_bindings {
     use nalgebra::{DMatrix, DVector};
-    use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, Element};
+    use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
 
@@ -47,7 +54,7 @@ mod python_bindings {
     }
 
     // -----------------------------------------------------------------------
-    // Python-exposed functions
+    // Algorithm 1 — Modified Cholesky
     // -----------------------------------------------------------------------
 
     /// Algorithm 1: LU-based Gram matrix decomposition with row normalisation.
@@ -59,9 +66,6 @@ mod python_bindings {
     /// Returns:
     ///     C matrix of shape (p+1, p+1), dtype float64, diagonal = 1.
     ///     Pass to ``back_substitute`` to recover OLS coefficients.
-    ///
-    /// Raises:
-    ///     ValueError: on dimension mismatch or singular Gram matrix.
     #[pyfunction]
     pub fn modified_cholesky<'py>(
         py: Python<'py>,
@@ -74,23 +78,19 @@ mod python_bindings {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let rows = c.nrows();
         let cols = c.ncols();
-        // Convert column-major nalgebra → row-major numpy
         let data: Vec<f64> = c.transpose().as_slice().to_vec();
         let arr = PyArray1::from_vec(py, data);
         arr.reshape([rows, cols])
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// Back-substitute C matrix to recover OLS coefficients.
+    /// Back-substitute C to recover OLS coefficients.
     ///
     /// Args:
     ///     c: numpy float64 array of shape (p+1, p+1) — output of ``modified_cholesky``
     ///
     /// Returns:
     ///     beta: numpy float64 array of shape (p,)
-    ///
-    /// Raises:
-    ///     ValueError: on invalid input.
     #[pyfunction]
     pub fn back_substitute<'py>(
         py: Python<'py>,
@@ -110,9 +110,6 @@ mod python_bindings {
     ///
     /// Returns:
     ///     beta: numpy float64 array of shape (p,), the OLS coefficients.
-    ///
-    /// Raises:
-    ///     ValueError: on dimension mismatch or singular matrix.
     #[pyfunction]
     pub fn solve_ols<'py>(
         py: Python<'py>,
@@ -126,6 +123,10 @@ mod python_bindings {
         Ok(beta.as_slice().to_vec().into_pyarray(py))
     }
 
+    // -----------------------------------------------------------------------
+    // Algorithm 2 — Simplified Gram-Schmidt (SGSO)
+    // -----------------------------------------------------------------------
+
     /// Algorithm 2: Non-normalised Gram-Schmidt orthogonalisation (SGSO).
     ///
     /// Args:
@@ -133,9 +134,6 @@ mod python_bindings {
     ///
     /// Returns:
     ///     Q: numpy float64 array of shape (n, p) — orthogonal columns, not normalised.
-    ///
-    /// Raises:
-    ///     ValueError: on invalid input.
     #[pyfunction]
     pub fn simplified_gram_schmidt<'py>(
         py: Python<'py>,
@@ -152,6 +150,10 @@ mod python_bindings {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    // -----------------------------------------------------------------------
+    // Algorithm 3 — Weighted generalised inverse
+    // -----------------------------------------------------------------------
+
     /// Algorithm 3: Weighted generalised inverse ``(XᵀWX)⁻¹ Xᵀ W``.
     ///
     /// Args:
@@ -161,9 +163,6 @@ mod python_bindings {
     /// Returns:
     ///     G: numpy float64 array of shape (p, n).
     ///        Weighted OLS solution: ``beta = G @ y``.
-    ///
-    /// Raises:
-    ///     ValueError: on dimension mismatch or singular matrix.
     #[pyfunction]
     pub fn weighted_generalized_inverse<'py>(
         py: Python<'py>,
@@ -183,23 +182,10 @@ mod python_bindings {
     }
 
     // -----------------------------------------------------------------------
-    // Algorithm 4 — Direct Gram matrix LU solve (K-FAC / Shampoo)
+    // General Gram-LU utilities — useful primitives for OLS workflows.
     // -----------------------------------------------------------------------
 
     /// Solve ``gram · X = rhs`` via LU factorisation — no explicit inverse.
-    ///
-    /// Core operation for second-order optimisers (K-FAC, Shampoo) that have
-    /// a pre-computed Gram matrix and need to apply its inverse to a RHS.
-    ///
-    /// Args:
-    ///     gram: numpy float64 array of shape (p, p), symmetric PSD
-    ///     rhs:  numpy float64 array of shape (p, k)
-    ///
-    /// Returns:
-    ///     X: numpy float64 array of shape (p, k) such that gram @ X ≈ rhs
-    ///
-    /// Raises:
-    ///     ValueError: on dimension mismatch or singular matrix.
     #[pyfunction]
     pub fn lu_solve_gram<'py>(
         py: Python<'py>,
@@ -219,13 +205,6 @@ mod python_bindings {
     }
 
     /// Solve ``gram · x = rhs`` for a single vector RHS.
-    ///
-    /// Args:
-    ///     gram: numpy float64 array of shape (p, p)
-    ///     rhs:  numpy float64 array of shape (p,)
-    ///
-    /// Returns:
-    ///     x: numpy float64 array of shape (p,)
     #[pyfunction]
     pub fn lu_solve_gram_vec<'py>(
         py: Python<'py>,
@@ -240,16 +219,6 @@ mod python_bindings {
     }
 
     /// Compute ``gram⁻¹`` via LU factorisation.
-    ///
-    /// When K-FAC needs to cache the preconditioner for repeated application,
-    /// an explicit inverse is appropriate. This computes it via LU rather than
-    /// direct inversion for better numerical stability.
-    ///
-    /// Args:
-    ///     gram: numpy float64 array of shape (p, p)
-    ///
-    /// Returns:
-    ///     gram_inv: numpy float64 array of shape (p, p)
     #[pyfunction]
     pub fn lu_inverse_gram<'py>(
         py: Python<'py>,
@@ -266,240 +235,6 @@ mod python_bindings {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// Fast K-FAC inverse: ``(gram + damping·I)⁻¹`` on f32 data.
-    ///
-    /// Compared with calling ``lu_inverse_gram`` on a float64 array, this
-    /// function avoids the f32 → f64 dtype cast, the Tikhonov damping
-    /// allocation, and the intermediate nalgebra matrix — reducing the
-    /// per-call copy count from 6+ to 2.
-    ///
-    /// Args:
-    ///     gram:    numpy float32 array of shape (n, n), C-contiguous
-    ///     damping: scalar λ added to the diagonal before inversion
-    ///
-    /// Returns:
-    ///     gram_inv: numpy float32 array of shape (n, n)
-    #[pyfunction]
-    pub fn lu_damped_inverse_f32<'py>(
-        py: Python<'py>,
-        gram: PyReadonlyArray2<'py, f32>,
-        damping: f64,
-    ) -> PyResult<&'py PyArray2<f32>> {
-        let shape = gram.shape();
-        let n = shape[0];
-        if shape[1] != n {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "gram must be square",
-            ));
-        }
-        let slice = gram
-            .as_slice()
-            .expect("C-contiguous f32 array required; call .contiguous() first");
-        let result = algorithms::lu_damped_inverse_f32(slice, n, damping as f32);
-        let arr = PyArray1::from_vec(py, result);
-        arr.reshape([n, n])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    }
-
-    /// Compute the symmetric eigendecomposition of a Gram matrix (fast path for K-FAC).
-    ///
-    /// Uses faer's SIMD-accelerated self-adjoint EVD on f32 data.
-    /// Damping is applied in eigenvalue space so Q can be reused when only
-    /// changing the damping coefficient.
-    ///
-    /// Args:
-    ///     gram   : numpy float32 array of shape (n, n), symmetric PSD
-    ///     damping: scalar δ — returns 1 / max(λᵢ + δ, 1e-8)
-    ///
-    /// Returns:
-    ///     (q, inv_lambda) where q is (n, n) float32 and inv_lambda is (n,) float32
-    #[pyfunction]
-    pub fn eigh_f32<'py>(
-        py: Python<'py>,
-        gram: PyReadonlyArray2<'py, f32>,
-        damping: f64,
-    ) -> PyResult<(&'py PyArray2<f32>, &'py PyArray1<f32>)> {
-        let shape = gram.shape();
-        let n = shape[0];
-        if shape[1] != n {
-            return Err(pyo3::exceptions::PyValueError::new_err("gram must be square"));
-        }
-        let slice = gram
-            .as_slice()
-            .expect("C-contiguous f32 array required");
-        let (q_flat, inv_lam) = algorithms::eigh_f32(slice, n, damping as f32);
-        let q_arr = PyArray1::from_vec(py, q_flat)
-            .reshape([n, n])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let lam_arr = PyArray1::from_vec(py, inv_lam);
-        Ok((q_arr, lam_arr))
-    }
-
-    /// Low-rank symmetric EVD: return top-k eigenvectors and damped inverse eigenvalues.
-    ///
-    /// Like ``eigh_f32`` but returns only the ``k`` eigenvectors for the largest eigenvalues,
-    /// giving an n×k matrix Q_k.  The apply step then costs O((k_g+k_a)·d_out·d_in) instead
-    /// of O(4·n·d_out·d_in), which is the genuine speedup over the full-rank eigen path.
-    ///
-    /// Args:
-    ///     gram   : numpy float32 array of shape (n, n), symmetric PSD
-    ///     k      : number of top eigenvectors to keep
-    ///     damping: scalar δ — returns 1 / max(λᵢ + δ, 1e-8)
-    ///
-    /// Returns:
-    ///     (q_k, inv_lambda_k) where q_k is (n, k) float32 and inv_lambda_k is (k,) float32
-    #[pyfunction]
-    pub fn eigh_topk_f32<'py>(
-        py: Python<'py>,
-        gram: PyReadonlyArray2<'py, f32>,
-        k: usize,
-        damping: f64,
-    ) -> PyResult<(&'py PyArray2<f32>, &'py PyArray1<f32>)> {
-        let shape = gram.shape();
-        let n = shape[0];
-        if shape[1] != n {
-            return Err(pyo3::exceptions::PyValueError::new_err("gram must be square"));
-        }
-        if k == 0 || k > n {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("k must be in [1, n], got k={k}, n={n}"),
-            ));
-        }
-        let slice = gram
-            .as_slice()
-            .expect("C-contiguous f32 array required");
-        let (q_flat, inv_lam) = algorithms::eigh_topk_f32(slice, n, k, damping as f32);
-        let q_arr = PyArray1::from_vec(py, q_flat)
-            .reshape([n, k])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let lam_arr = PyArray1::from_vec(py, inv_lam);
-        Ok((q_arr, lam_arr))
-    }
-
-    /// Apply the low-rank K-FAC preconditioner: ΔW ≈ Q_G_k d_G_k Q_G_kᵀ grad Q_A_k d_A_k Q_A_kᵀ
-    ///
-    /// Uses rank-k approximations of A and G, reducing apply cost from O(4n·d_out·d_in)
-    /// to O((k_g+k_a)·d_out·d_in).  For k=32, n=512 this is ~16× fewer FLOPs.
-    ///
-    /// Args:
-    ///     q_g_k      : (d_out, k_g) float32 top-k eigenvectors of G
-    ///     inv_lam_g_k: (k_g,)       float32 damped inverse eigenvalues of G
-    ///     grad       : (d_out, d_in) float32 weight gradient
-    ///     q_a_k      : (d_in,  k_a) float32 top-k eigenvectors of A
-    ///     inv_lam_a_k: (k_a,)       float32 damped inverse eigenvalues of A
-    ///
-    /// Returns:
-    ///     (d_out, d_in) float32 preconditioned gradient
-    #[pyfunction]
-    pub fn apply_kfac_lowrank_f32<'py>(
-        py: Python<'py>,
-        q_g_k: PyReadonlyArray2<'py, f32>,
-        inv_lam_g_k: PyReadonlyArray1<'py, f32>,
-        grad: PyReadonlyArray2<'py, f32>,
-        q_a_k: PyReadonlyArray2<'py, f32>,
-        inv_lam_a_k: PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<&'py PyArray2<f32>> {
-        let d_out = grad.shape()[0];
-        let d_in  = grad.shape()[1];
-        let k_g   = q_g_k.shape()[1];
-        let k_a   = q_a_k.shape()[1];
-        let qg_s  = q_g_k.as_slice().expect("C-contiguous q_g_k required");
-        let qa_s  = q_a_k.as_slice().expect("C-contiguous q_a_k required");
-        let gr_s  = grad.as_slice().expect("C-contiguous grad required");
-        let lg_s  = inv_lam_g_k.as_slice().expect("C-contiguous inv_lam_g_k required");
-        let la_s  = inv_lam_a_k.as_slice().expect("C-contiguous inv_lam_a_k required");
-        let result = algorithms::apply_kfac_lowrank_f32(
-            qg_s, k_g, lg_s,
-            gr_s, d_out, d_in,
-            qa_s, k_a, la_s,
-        );
-        PyArray1::from_vec(py, result)
-            .reshape([d_out, d_in])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    }
-
-    /// Apply the K-FAC eigen-basis preconditioner: ΔW = Q_G d_G Q_Gᵀ grad Q_A d_A Q_Aᵀ
-    ///
-    /// All 4 matrix products and the element-wise scaling are fused inside a single
-    /// Rust call, eliminating Python dispatch overhead for the per-step hot path.
-    ///
-    /// Args:
-    ///     q_g      : (d_out, d_out) float32 eigenvectors of G
-    ///     inv_lam_g: (d_out,)       float32 damped inverse eigenvalues of G
-    ///     grad     : (d_out, d_in)  float32 weight gradient
-    ///     q_a      : (d_in,  d_in)  float32 eigenvectors of A
-    ///     inv_lam_a: (d_in,)        float32 damped inverse eigenvalues of A
-    ///
-    /// Returns:
-    ///     (d_out, d_in) float32 preconditioned gradient
-    #[pyfunction]
-    pub fn apply_kfac_eigen_f32<'py>(
-        py: Python<'py>,
-        q_g: PyReadonlyArray2<'py, f32>,
-        inv_lam_g: PyReadonlyArray1<'py, f32>,
-        grad: PyReadonlyArray2<'py, f32>,
-        q_a: PyReadonlyArray2<'py, f32>,
-        inv_lam_a: PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<&'py PyArray2<f32>> {
-        let d_out = grad.shape()[0];
-        let d_in  = grad.shape()[1];
-        let qg_s = q_g.as_slice().expect("C-contiguous q_g required");
-        let qa_s = q_a.as_slice().expect("C-contiguous q_a required");
-        let gr_s = grad.as_slice().expect("C-contiguous grad required");
-        let lg_s = inv_lam_g.as_slice().expect("C-contiguous inv_lam_g required");
-        let la_s = inv_lam_a.as_slice().expect("C-contiguous inv_lam_a required");
-        let result = algorithms::apply_kfac_eigen_f32(
-            qg_s, lg_s, d_out,
-            gr_s,
-            qa_s, la_s, d_in,
-        );
-        PyArray1::from_vec(py, result)
-            .reshape([d_out, d_in])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    }
-
-    /// Randomized symmetric EVD — approximate top-k eigenvectors in O(k·n²).
-    ///
-    /// Uses the Halko-Martinsson-Tropp randomized range-finder:
-    /// random projection → power iteration → Gram-Schmidt → small exact EVD.
-    /// 24× cheaper than full EVD for k=32, n=784 with <1% error on K-FAC matrices.
-    ///
-    /// Args:
-    ///     gram   : numpy float32 array of shape (n, n), symmetric PSD
-    ///     k      : number of top eigenvectors to approximate
-    ///     n_iter : power-iteration passes (default 1; use 2 for slowly-decaying spectra)
-    ///     damping: scalar δ — returns 1 / max(λᵢ + δ, 1e-8)
-    ///
-    /// Returns:
-    ///     (q_k, inv_lambda_k) where q_k is (n, k) float32 and inv_lambda_k is (k,) float32
-    #[pyfunction]
-    pub fn randomized_eigh_f32<'py>(
-        py: Python<'py>,
-        gram: PyReadonlyArray2<'py, f32>,
-        k: usize,
-        n_iter: usize,
-        damping: f64,
-    ) -> PyResult<(&'py PyArray2<f32>, &'py PyArray1<f32>)> {
-        let shape = gram.shape();
-        let n = shape[0];
-        if shape[1] != n {
-            return Err(pyo3::exceptions::PyValueError::new_err("gram must be square"));
-        }
-        if k == 0 || k > n {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("k must be in [1, n], got k={k}, n={n}"),
-            ));
-        }
-        let slice = gram.as_slice().expect("C-contiguous f32 array required");
-        let (q_flat, inv_lam) =
-            algorithms::randomized_eigh_f32(slice, n, k, n_iter, damping as f32);
-        let q_arr = PyArray1::from_vec(py, q_flat)
-            .reshape([n, k])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let lam_arr = PyArray1::from_vec(py, inv_lam);
-        Ok((q_arr, lam_arr))
-    }
-
     // -----------------------------------------------------------------------
     // Module registration
     // -----------------------------------------------------------------------
@@ -514,12 +249,6 @@ mod python_bindings {
         m.add_function(wrap_pyfunction!(lu_solve_gram, m)?)?;
         m.add_function(wrap_pyfunction!(lu_solve_gram_vec, m)?)?;
         m.add_function(wrap_pyfunction!(lu_inverse_gram, m)?)?;
-        m.add_function(wrap_pyfunction!(lu_damped_inverse_f32, m)?)?;
-        m.add_function(wrap_pyfunction!(eigh_f32, m)?)?;
-        m.add_function(wrap_pyfunction!(apply_kfac_eigen_f32, m)?)?;
-        m.add_function(wrap_pyfunction!(eigh_topk_f32, m)?)?;
-        m.add_function(wrap_pyfunction!(apply_kfac_lowrank_f32, m)?)?;
-        m.add_function(wrap_pyfunction!(randomized_eigh_f32, m)?)?;
         Ok(())
     }
 }

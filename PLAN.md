@@ -4,6 +4,47 @@ This document describes what I have *already done* in this directory, what I sti
 
 ---
 
+## 0. Performance migration to faer SIMD (in progress — 2026-06-22)
+
+Three optimisations requested.  Items 1 and 3 implemented; Item 2 deferred pending design decision.
+
+### ✓ Item 1 — `modified_cholesky` uses faer Cholesky (DONE)
+
+Replaced `nalgebra::linalg::Cholesky::new(gram)` with a `faer_cholesky_upper` helper that converts the augmented Gram to a `faer::Mat<f64>`, runs faer's SIMD-accelerated Cholesky, and converts the upper-triangular factor back to `nalgebra::DMatrix<f64>`.  LDLᵀ fallback for the PSD-singular (exact-fit) case is preserved.  Expected speedup: 3–5× at p~100.
+
+### ✓ Item 3 — `weighted_generalized_inverse` matmuls use faer (DONE)
+
+Replaced the two large dense matmuls (`Xᵀ · W` and `(XᵀW) · X`) with a `faer_matmul` helper.  The small (p×p) LU solve is kept on nalgebra because it is dominated by the matmul costs.  Expected speedup: 2–5× at n~300, p~100 (dense W), driven by the `Xᵀ · W` step which is `O(n²·p)`.
+
+### ✓ Item 2 — `simplified_gram_schmidt` BLAS dot products (DONE — Path A)
+
+**Path A chosen.**  Added `cblas` + `openblas-src` as dependencies behind a default-on `blas` feature flag.  `simplified_gram_schmidt` was rewritten to extract a `&[f64]` slice for each column of Q and feed it to `cblas::ddot` (dot product) and `cblas::daxpy` (`y ← y + α·x`).  Expected speedup: 3–6× at p ~ 100, n ~ 300.
+
+Two helper functions `sgso_dot` and `sgso_axpy` dispatch at compile time via `#[cfg(feature = "blas")]`:
+
+- `feature = "blas"` (default): calls `cblas::ddot` / `cblas::daxpy` → OpenBLAS SIMD-tuned kernel.
+- `feature = "blas"` disabled: hand-rolled Rust loops that LLVM auto-vectorises adequately for small problem sizes.
+
+**Build prerequisite (default path):** OpenBLAS must be installed and on the link search path.
+
+| OS | Install command | Notes |
+|---|---|---|
+| Linux | `sudo apt install libopenblas-dev` | Or `dnf`, `pacman`, etc. |
+| macOS | `brew install openblas`           | Set `OPENBLAS_DIR=$(brew --prefix openblas)` if cargo doesn't find it |
+| Windows (MSVC) | `vcpkg install openblas` + `vcpkg integrate install` | Or download a pre-built binary from the OpenBLAS releases page and set `LIB`/`PATH` accordingly |
+
+**Fallback for machines without OpenBLAS:**
+
+```bash
+cargo build --release --no-default-features --features python
+```
+
+This drops the BLAS path and uses the pure-Rust auto-vectorised fallback.  Same correctness, ~3–6× slower at the SGSO inner loop, but no system dependency.
+
+---
+
+---
+
 ## 1. What's already in place
 
 I copied source files from `C:\Users\Admin\OlsVered` and applied a minimal Python rename (`from optimizer.X` → `from invfree_vered_mols.X`). The current tree:
@@ -40,7 +81,64 @@ Status: imports rewritten, Python files syntax-check clean. **The Rust crate has
 
 ---
 
-## 2. Which bug? — please confirm
+## 2. Bug confirmed and fixed (2026-06-22)
+
+### The bug
+
+`rust/src/algorithms.rs::modified_cholesky` used `nalgebra::linalg::LU::new(gram)` and read `lu.u()` directly. **Partial-pivoting LU computes `P·A = L·U`**: the returned `U` is the upper-triangular factor of `P·A`, *not* of `A`. The augmented Gram `M = [X|y]ᵀ[X|y]` is SPD in exact arithmetic, but in floating point partial pivoting still swaps rows whenever an off-diagonal entry exceeds the diagonal — which happens routinely for the augmented Gram, because `|Xᵀy[i]|` is frequently larger than `‖X[:,i]‖²`. When the swap puts the y-column row into a non-final position, the back-substitution invariant ("set `β[p] = −1`, the last C row encodes the y-relation") breaks, and the recovered β drifts from the true OLS solution.
+
+### How it slipped past the existing tests
+
+- `test_solve_ols_exact_system` uses a system where y is exactly in span(X). In that case the augmented Gram is singular and the last U row becomes all zeros regardless of pivoting → the back-substitution gets a correct answer by accident.
+- `test_solve_ols_5x3_system` has a tolerance of `< 3.0` on residuals — almost certainly widened in response to the (then-unexplained) drift caused by this very bug.
+
+### How it was exposed
+
+The user ran `examples/demo_alg1_modified_cholesky.py` at n=300, p=100, σ_noise=0.1 (the first test case that is both full-rank with noise and large enough for pivoting to swap):
+
+| Path | ‖β − β_true‖ | ‖β − β_QR‖ |
+|---|---|---|
+| Householder QR (textbook reference) | 7.05e-02 | 0 |
+| NumPy fallback (uses Cholesky)      | 7.05e-02 | **1.66e-14** |
+| Rust olssm (uses LU)                | 7.12e-02 | **5.64e-03** ← drift |
+
+The NumPy fallback was already using Cholesky (because the demo's pure-NumPy reference implementation tries Cholesky first and falls back to scipy LU only on failure). The Rust path was the only one using LU. That's exactly the contrast the demo measured.
+
+### The fix
+
+Replace `LU::new(gram)` with `Cholesky::new(gram)`, with an explicit no-pivot LDLᵀ fallback for the singular (exact-fit) case:
+
+```rust
+let u = match nalgebra::linalg::Cholesky::new(gram.clone()) {
+    Some(chol) => chol.l().transpose(),     // U = L^T from gram = LL^T
+    None => {
+        let mut work = gram;
+        ldlt_upper_in_place(&mut work, p)?  // PSD-singular fallback, also unpivoted
+    }
+};
+```
+
+Cholesky is unpivoted by construction (Higham 2002 §10), exploits the SPD structure (≈ 2× faster than LU), and is the textbook factorisation for SPD matrices — so it both fixes the correctness bug and is the algorithmically natural choice for an algorithm named "Modified *Cholesky*".
+
+### Regression test added
+
+`rust/tests/test_algorithms.rs::test_solve_ols_matches_householder_qr_at_scale` builds n=300, p=100 well-conditioned random Gaussian X via a deterministic LCG, solves OLS via `solve_ols`, and compares against nalgebra's Householder-QR reference. Fails the build if the LU-pivoting bug regresses.
+
+### Verify the fix
+
+```powershell
+cd C:\Users\Admin\InvFreeVeredMOLS\rust
+cargo test --release                 # the new regression test should pass
+maturin develop --features python --release
+cd ..
+python examples\demo_alg1_modified_cholesky.py
+# Expected: '‖β_alg1 − β_QR‖₂ ~ 1e-14' and the '✓ matches Householder QR to
+# machine precision' verdict
+```
+
+---
+
+## 2-old. Original candidate list (kept for context)
 
 You said "we had a bug in this project that you pointed out to me 2 days ago." I checked git log on `C:\Users\Admin\OlsVered` for commits and notes from 2026-06-19 through 2026-06-21 touching the OLS-solver-relevant files (`olssm_kfac.py`, `gram_estimator.py`, `backend.py`, `hooks.py`, `src/`). I did not find an obvious unfixed issue with that label. My honest candidates, ordered by my best guess at what you mean:
 
